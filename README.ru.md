@@ -26,7 +26,7 @@
 ## 📸 Скриншоты
 
 <p align="center">
-  <img src="screenshot.png" width="480" alt="Главное окно приложения">
+  <img src="preview.png" width="480" alt="Главное окно приложения">
 </p>
 
 ## 📦 Установка

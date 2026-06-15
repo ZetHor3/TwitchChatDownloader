@@ -26,7 +26,7 @@
 ## 📸 Скріншоти
 
 <p align="center">
-  <img src="screenshot.png" width="480" alt="Головне вікно програми">
+  <img src="preview.png" width="480" alt="Головне вікно програми">
 </p>
 
 ## 📦 Встановлення
