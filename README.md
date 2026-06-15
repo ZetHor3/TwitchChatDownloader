@@ -45,7 +45,7 @@ A fast and simple desktop app to download chat messages from Twitch VODs. Export
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/ZetHor3/twitch-chat-downloader.git
+git clone https://github.com/ZetHor3/TwitchChatDownloader.git
 cd twitch-chat-downloader
 
 # 2. Install dependencies
