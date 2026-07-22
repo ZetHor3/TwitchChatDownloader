@@ -21,6 +21,8 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -124,7 +126,7 @@ class CircularProgress(QWidget):
 
 class MainWindow(QMainWindow):
     TITLE = "Twitch Chat Downloader"
-    WIDTH, HEIGHT = 540, 660
+    WIDTH, HEIGHT = 540, 700
 
     def __init__(self):
         super().__init__()
@@ -133,11 +135,20 @@ class MainWindow(QMainWindow):
         self._lang = "en"
         self._progress_start = 0.0
         self._preview_info = None
+        # Download queue
+        self._queue = []          # list of download tasks
+        self._queue_id = 0        # unique id per queued item
+        self._is_downloading = False
 
         # Debounce timer for URL validation
         self._url_check_timer = QTimer(self)
         self._url_check_timer.setSingleShot(True)
         self._url_check_timer.timeout.connect(self._on_url_check)
+
+        # Debounce timer for queue URL validation
+        self._queue_url_check_timer = QTimer(self)
+        self._queue_url_check_timer.setSingleShot(True)
+        self._queue_url_check_timer.timeout.connect(self._on_queue_url_check)
 
         self._setup_window()
         self._build_ui()
@@ -199,8 +210,19 @@ class MainWindow(QMainWindow):
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(16, 4, 16, 10)
         card_layout.setSpacing(0)
-        vbox.addWidget(card)
-        vbox.addStretch()
+        vbox.addWidget(card, 0)
+
+        # ---- Queue area (visible only during download) ----
+        self._build_queue_ui()
+        vbox.addWidget(self.queue_widget, 1)  # fills space when visible
+
+        # Stretch spacer — fills space when queue is hidden, hidden alongside queue
+        self._layout_spacer = QWidget()
+        self._layout_spacer.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding,
+        )
+        vbox.addWidget(self._layout_spacer, 1)
 
         # ---- Step 1: Input ----
         self.step_input = QWidget()
@@ -338,7 +360,8 @@ class MainWindow(QMainWindow):
         threads_row.addStretch()
         si_layout.addLayout(threads_row)
 
-        self.btn_download = QPushButton("⬇  Download Chat")
+        self.btn_download = QPushButton("  Download Chat")
+        self.btn_download.setIcon(QIcon(os.path.join(_ASSETS, "download.svg")))
         self.btn_download.setEnabled(False)
         self.btn_download.setObjectName("btnPrimary")
         self.btn_download.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -386,19 +409,24 @@ class MainWindow(QMainWindow):
 
         sp_layout.addLayout(ring_row)
 
-        # Linear progress bar
-        self.progress_bar = QFrame()
-        self.progress_bar.setFixedHeight(4)
-        self.progress_bar.setStyleSheet("background: #0d1117; border-radius: 2px;")
-        self.progress_fill = QFrame(self.progress_bar)
-        self.progress_fill.setFixedHeight(4)
-        self.progress_fill.setStyleSheet("background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
-                                          "stop:0 #7c5cfc, stop:1 #b388ff); border-radius: 2px;")
-        self.progress_fill.setFixedWidth(0)
+        # Progress action buttons: pause / resume + cancel
+        progress_btn_row = QHBoxLayout()
+        progress_btn_row.setSpacing(12)
+        progress_btn_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        sp_layout.addWidget(self.progress_bar)
+        self.btn_pause = QPushButton("⏸  Pause")
+        self.btn_pause.setStyleSheet("""
+            QPushButton {
+                background: transparent; border: 1px solid #484f58;
+                border-radius: 6px; padding: 6px 14px;
+                font-size: 13px; color: #e6edf3;
+            }
+            QPushButton:hover { background: #222a3a; border-color: #7c5cfc; color: #7c5cfc; }
+        """)
+        self.btn_pause.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_pause.clicked.connect(self._on_pause)
+        progress_btn_row.addWidget(self.btn_pause)
 
-        # Cancel button
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setStyleSheet("""
             QPushButton {
@@ -410,7 +438,9 @@ class MainWindow(QMainWindow):
         """)
         self.btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_cancel.clicked.connect(self._on_cancel)
-        sp_layout.addWidget(self.btn_cancel, alignment=Qt.AlignmentFlag.AlignCenter)
+        progress_btn_row.addWidget(self.btn_cancel)
+
+        sp_layout.addLayout(progress_btn_row)
 
         self.step_progress.hide()
         card_layout.addWidget(self.step_progress)
@@ -556,6 +586,160 @@ class MainWindow(QMainWindow):
         vbox.addWidget(footer_frame)
 
     # ------------------------------------------------------------
+    #  Queue UI
+    # ------------------------------------------------------------
+    def _build_queue_ui(self):
+        """Build the download-queue input area (shown beneath the card during downloads)."""
+        self.queue_widget = QWidget()
+        self.queue_widget.setObjectName("queueWidget")
+        self.queue_widget.setStyleSheet("""
+            #queueWidget {
+                background: #1c2333;
+                border: 1px solid #2d3548;
+                border-radius: 14px;
+                margin-top: 5px;
+            }
+        """)
+        self.queue_widget.hide()
+
+        qw_layout = QVBoxLayout(self.queue_widget)
+        qw_layout.setContentsMargins(16, 5, 16, 10)
+        qw_layout.setSpacing(6)
+
+        # Title row with Cancel all button
+        queue_header = QHBoxLayout()
+        queue_header.setSpacing(6)
+        self._lbl_queue_title = QLabel("Download queue")
+        self._lbl_queue_title.setStyleSheet("font-size: 14px; font-weight: 600; color: #e6edf3;")
+        queue_header.addWidget(self._lbl_queue_title)
+        queue_header.addStretch()
+
+        self.btn_queue_cancel_all = QPushButton("Cancel all")
+        self.btn_queue_cancel_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_queue_cancel_all.setStyleSheet("""
+            QPushButton {
+                background: transparent; border: 1px solid #484f58;
+                border-radius: 6px; padding: 4px 12px;
+                font-size: 12px; color: #8b949e;
+            }
+            QPushButton:hover { background: #222a3a; color: #f85149; border-color: #f85149; }
+        """)
+        self.btn_queue_cancel_all.clicked.connect(self._on_cancel_all)
+        queue_header.addWidget(self.btn_queue_cancel_all)
+
+        qw_layout.addLayout(queue_header)
+
+        # Input row 1: URL + threads + add button
+        input_row1 = QHBoxLayout()
+        input_row1.setSpacing(8)
+
+        self._queue_url_input = QLineEdit()
+        self._queue_url_input.setPlaceholderText("https://www.twitch.tv/videos/2796577649")
+        self._queue_url_input.setStyleSheet("""
+            QLineEdit {
+                background: #0d1117; border: 1px solid #2d3548;
+                border-radius: 8px; padding: 10px 14px;
+                font-size: 14px; color: #e6edf3;
+            }
+            QLineEdit:focus { border-color: #7c5cfc; }
+        """)
+        self._queue_url_input.returnPressed.connect(self._on_add_to_queue)
+        self._queue_url_input.textChanged.connect(self._on_queue_url_text_changed)
+
+        self._queue_threads_spin = QSpinBox()
+        self._queue_threads_spin.setRange(1, 16)
+        self._queue_threads_spin.setValue(4)
+        self._queue_threads_spin.setFixedWidth(60)
+        self._queue_threads_spin.setStyleSheet("""
+            QSpinBox {
+                background: #0d1117; border: 1px solid #2d3548;
+                border-radius: 6px; padding: 4px 8px;
+                font-size: 13px; color: #e6edf3;
+            }
+            QSpinBox:focus { border-color: #7c5cfc; }
+            QSpinBox::up-button { width: 18px; }
+            QSpinBox::down-button { width: 18px; }
+        """)
+
+        self.btn_queue_add = QPushButton("Add in queue")
+        self.btn_queue_add.setObjectName("btnQueueAdd")
+        self.btn_queue_add.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_queue_add.setStyleSheet("""
+            QPushButton {
+                background: #7c5cfc; color: #fff; font-weight: 600;
+                font-size: 14px; border: none; border-radius: 8px;
+                padding: 10px 20px;
+            }
+            QPushButton:hover { background: #6a4de6; }
+            QPushButton:disabled { background: #3d2e7a; color: #8b949e; }
+        """)
+        self.btn_queue_add.clicked.connect(self._on_add_to_queue)
+
+        input_row1.addWidget(self._queue_url_input, 1)
+        input_row1.addWidget(self._queue_threads_spin)
+        input_row1.addWidget(self.btn_queue_add)
+        qw_layout.addLayout(input_row1)
+
+        # Input row 2: start / end time range (optional)
+        input_row2 = QHBoxLayout()
+        input_row2.setSpacing(6)
+
+        time_edit_style = """
+            QLineEdit {
+                background: #0d1117; border: 1px solid #2d3548;
+                border-radius: 6px; padding: 6px 8px;
+                font-size: 13px; color: #e6edf3;
+            }
+            QLineEdit:focus { border-color: #7c5cfc; }
+        """
+
+        lbl_start = QLabel("Start:")
+        lbl_start.setStyleSheet("font-size: 13px; color: #8b949e;")
+        input_row2.addWidget(lbl_start)
+
+        self._queue_input_start = QLineEdit()
+        self._queue_input_start.setPlaceholderText("00:00:00")
+        self._queue_input_start.setFixedWidth(80)
+        self._queue_input_start.setStyleSheet(time_edit_style)
+        input_row2.addWidget(self._queue_input_start)
+
+        lbl_end = QLabel("End:")
+        lbl_end.setStyleSheet("font-size: 13px; color: #8b949e;")
+        input_row2.addWidget(lbl_end)
+
+        self._queue_input_end = QLineEdit()
+        self._queue_input_end.setPlaceholderText("00:00:00")
+        self._queue_input_end.setFixedWidth(80)
+        self._queue_input_end.setStyleSheet(time_edit_style)
+        input_row2.addWidget(self._queue_input_end)
+
+        input_row2.addStretch()
+
+        self._queue_dur_label = QLabel("")
+        self._queue_dur_label.setStyleSheet("font-size: 12px; color: #484f58;")
+        input_row2.addWidget(self._queue_dur_label)
+
+        qw_layout.addLayout(input_row2)
+
+        # Queue item list (scrollable — stretches to fill space)
+        self._queue_scroll = QScrollArea()
+        self._queue_scroll.setWidgetResizable(True)
+        self._queue_scroll.setStyleSheet("""
+            QScrollArea {
+                background: #0d1117;
+                border: 1px solid #2d3548;
+                border-radius: 8px;
+            }
+        """)
+        self._queue_list_widget = QWidget()
+        self._queue_list_layout = QVBoxLayout(self._queue_list_widget)
+        self._queue_list_layout.setSpacing(2)
+        self._queue_list_layout.setContentsMargins(8, 6, 8, 6)
+        self._queue_list_layout.addStretch()
+        self._queue_scroll.setWidget(self._queue_list_widget)
+        qw_layout.addWidget(self._queue_scroll)
+
+    # ------------------------------------------------------------
     #  Styles
     # ------------------------------------------------------------
     @staticmethod
@@ -590,6 +774,17 @@ class MainWindow(QMainWindow):
         self.btn_csv.setText(f"📊 {t('csv_btn')}")
         self.btn_web.setText(f"🌐 {t('web_btn')}")
         self.btn_clear.setText(f"🗑 {t('clear_btn')}")
+        # Queue area
+        self._lbl_queue_title.setText(t("queue_title"))
+        self.btn_queue_add.setText(t("in_queue"))
+        self.btn_queue_cancel_all.setText(t("cancel_all_btn"))
+        self._queue_url_input.setPlaceholderText(t("url_placeholder"))
+        self._rebuild_queue_list()  # refresh empty-label text
+        # Pause / Resume button (depends on current worker state)
+        if self._worker and self._worker.is_paused:
+            self.btn_pause.setText("▶  " + t("resume_btn"))
+        else:
+            self.btn_pause.setText("⏸  " + t("pause_btn"))
         base_powered = t("powered_by")  # e.g. "Powered by Mr3ster"
         linked = base_powered.replace(
             "Mr3ster",
@@ -710,6 +905,42 @@ class MainWindow(QMainWindow):
             pass  # thumb is optional, keep grey
 
     # ------------------------------------------------------------
+    #  Queue URL validation
+    # ------------------------------------------------------------
+    def _on_queue_url_text_changed(self, text: str):
+        """Debounced validation for queue URL input."""
+        if text.strip():
+            self._queue_url_check_timer.start(600)
+        else:
+            self._queue_url_check_timer.stop()
+            self._queue_input_end.setPlaceholderText("00:00:00")
+            self._queue_dur_label.setText("")
+
+    def _on_queue_url_check(self):
+        """Debounced: fetch video info for queue URL and show duration."""
+        url = self._queue_url_input.text().strip()
+        if not url:
+            self._queue_dur_label.setText("")
+            return
+
+        try:
+            video_id = extract_video_id(url)
+        except ValueError:
+            self._queue_dur_label.setText("")
+            return
+
+        self._queue_dur_label.setText("⏳ …")
+
+        try:
+            info = get_video_info(video_id)
+            dur_sec = info.get("length_seconds", 0)
+            self._queue_dur_label.setText(f"⏱ {self._fmt_duration(dur_sec)}")
+            self._queue_input_end.setPlaceholderText(self._fmt_tc(dur_sec))
+        except Exception:
+            self._queue_dur_label.setText("⚠ error")
+            self._queue_input_end.setPlaceholderText("00:00:00")
+
+    # ------------------------------------------------------------
     #  Step visibility
     # ------------------------------------------------------------
     def _show_step(self, step: str):
@@ -720,7 +951,7 @@ class MainWindow(QMainWindow):
             getattr(self, step).show()
 
     # ------------------------------------------------------------
-    #  Download
+    #  Download & Queue
     # ------------------------------------------------------------
     def _on_download(self):
         url = self.url_input.text().strip()
@@ -728,23 +959,36 @@ class MainWindow(QMainWindow):
             self.url_input.setFocus()
             return
 
+        start_sec = self._parse_timecode(self._input_start.text())
+        end_sec = self._parse_timecode(self._input_end.text())
+        threads = self.threads_spin.value()
+
+        if self._is_downloading:
+            # Already downloading — add to queue instead
+            item = self._queue_add(url, threads, start_sec, end_sec)
+            self._rebuild_queue_list()
+            self.url_input.clear()
+            self._input_start.clear()
+            self._input_end.clear()
+            return
+
+        self._start_download(url, threads, start_sec, end_sec)
+
+    def _start_download(self, url: str, threads: int, start_sec, end_sec):
+        """Start (or continue) a download, switching to the progress view."""
+        self._is_downloading = True
         self._show_step("step_progress")
         self.circular_progress.set_value(0, smooth=False)
         self.circular_progress.set_sub_text("")
-        self._set_progress_bar(0)
         self.lbl_msgs.setText(self._tr("zero_msgs"))
         self.lbl_status.setText(self._tr("connecting"))
         self._progress_start = time.monotonic()
         self.btn_download.setEnabled(False)
         self.btn_download.setText(self._tr("downloading_btn"))
 
-        # Parse time range
-        start_sec = self._parse_timecode(self._input_start.text())
-        end_sec = self._parse_timecode(self._input_end.text())
-
         self._worker = DownloadWorker(
             url,
-            threads=self.threads_spin.value(),
+            threads=threads,
             start_sec=start_sec,
             end_sec=end_sec,
         )
@@ -753,16 +997,23 @@ class MainWindow(QMainWindow):
         self._worker.error_happened.connect(self._on_error)
         self._worker.start()
 
+        # Reset pause button to default state
+        self.btn_pause.setText("⏸  " + self._tr("pause_btn"))
+
+        # Show queue area so user can add more items
+        self._update_queue_title()
+        self.queue_widget.show()
+        self._layout_spacer.hide()
+        self._queue_url_input.setFocus()
+
     def _on_progress(self, pct: int, count: int, remaining: float, total: int, error: str):
         if error:
             self.lbl_status.setText(f"⚠ {error}")
             return
 
         self.circular_progress.set_value(pct)
-        self._set_progress_bar(pct)
         self.lbl_msgs.setText(self._tr("messages", count=f"{count:,}") if count else self._tr("zero_msgs"))
 
-        # Real ETA based on wall-clock elapsed time, NOT video position
         elapsed = time.monotonic() - self._progress_start
         if pct > 0 and elapsed > 3:
             total_est = elapsed / (pct / 100)
@@ -776,34 +1027,211 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, result: dict):
         self._result = result
-        self.btn_download.setEnabled(True)
-        self.btn_download.setText(self._tr("download_btn"))
+        self._handle_done()
 
-        info = result["video_info"]
-        # Show preview card with downloaded video info
-        self._show_done_preview(info)
-        msgs_label = self._tr("messages", count=f"{result['total_comments']:,}")
-        self.done_info_title.setText(f"📝 {msgs_label}")
-        self.circular_progress.set_value(100)
-        self._set_progress_bar(100)
-        self._show_step("step_done")
+    def _handle_done(self):
+        """Show the done/export screen or start the next queued download."""
+        if self._queue:
+            self._process_queue()
+        else:
+            self._is_downloading = False
+            self.queue_widget.hide()
+            self._layout_spacer.show()
+            self.btn_download.setEnabled(True)
+            self.btn_download.setText(self._tr("download_btn"))
+
+            if self._result:
+                info = self._result["video_info"]
+                self._show_done_preview(info)
+                msgs_label = self._tr("messages", count=f"{self._result['total_comments']:,}")
+                self.done_info_title.setText(f"📝 {msgs_label}")
+                self.circular_progress.set_value(100)
+                self._show_step("step_done")
 
     def _on_error(self, msg: str):
-        self.btn_download.setEnabled(True)
-        self.btn_download.setText(self._tr("download_btn"))
         self.lbl_error.setText(msg)
-        self._show_step("step_error")
+        if self._queue:
+            self._process_queue()
+        else:
+            self._is_downloading = False
+            self.queue_widget.hide()
+            self._layout_spacer.show()
+            self.btn_download.setEnabled(True)
+            self.btn_download.setText(self._tr("download_btn"))
+            self._show_step("step_error")
+
+    def _on_pause(self):
+        """Toggle pause / resume for the current download."""
+        if not self._worker:
+            return
+        if self._worker.is_paused:
+            self._worker.resume()
+            self.btn_pause.setText("⏸  " + self._tr("pause_btn"))
+        else:
+            self._worker.pause()
+            self.btn_pause.setText("▶  " + self._tr("resume_btn"))
 
     def _on_cancel(self):
-        """Cancel the running download and return to input step."""
+        """Cancel the running download. If queue has items, start next."""
         if self._worker:
             self._worker.cancel()
             self._worker.quit()
             self._worker.wait(2000)
+
+        if self._queue:
+            self._process_queue()
+        else:
+            self._is_downloading = False
+            self.queue_widget.hide()
+            self._layout_spacer.show()
+            self.btn_download.setEnabled(True)
+            self.btn_download.setText(self._tr("download_btn"))
+            self._show_step("step_input")
+            self.url_input.setFocus()
+
+    # ------------------------------------------------------------
+    #  Queue management
+    # ------------------------------------------------------------
+    def _on_add_to_queue(self):
+        """Called when user clicks 'Add in queue' or presses Enter in queue URL input."""
+        url = self._queue_url_input.text().strip()
+        if not url:
+            self._queue_url_input.setFocus()
+            return
+        start_sec = self._parse_timecode(self._queue_input_start.text())
+        end_sec = self._parse_timecode(self._queue_input_end.text())
+        item = self._queue_add(url, self._queue_threads_spin.value(), start_sec, end_sec)
+        self._rebuild_queue_list()
+        self._queue_url_input.clear()
+        self._queue_input_start.clear()
+        self._queue_input_end.clear()
+        self._queue_url_input.setFocus()
+
+    def _queue_add(self, url: str, threads: int, start_sec, end_sec) -> dict:
+        """Append a task to the queue and return the item dict."""
+        self._queue_id += 1
+        item = {
+            "id": self._queue_id,
+            "url": url,
+            "threads": threads,
+            "start_sec": start_sec,
+            "end_sec": end_sec,
+        }
+        self._queue.append(item)
+        return item
+
+    def _process_queue(self):
+        """Pop the first item from the queue and start downloading it."""
+        if not self._queue:
+            return
+        item = self._queue.pop(0)
+        self._rebuild_queue_list()
+        self._start_download(item["url"], item["threads"], item["start_sec"], item["end_sec"])
+
+    def _rebuild_queue_list(self):
+        """Clear the queue list widget and rebuild from self._queue."""
+        while self._queue_list_layout.count() > 1:
+            item = self._queue_list_layout.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+        if self._queue_list_layout.count() == 0:
+            self._queue_list_layout.addStretch()
+
+        if not self._queue:
+            empty = QLabel(self._tr("queue_empty"))
+            empty.setStyleSheet("font-size: 12px; color: #484f58; padding: 4px 0;")
+            self._queue_list_layout.insertWidget(0, empty)
+            return
+
+        for i, item in enumerate(self._queue):
+            row = self._make_queue_row(i, item)
+            self._queue_list_layout.insertWidget(i, row)
+
+        self._update_queue_title()
+
+    def _make_queue_row(self, index: int, item: dict) -> QFrame:
+        """Create a single row widget for a queued download."""
+        row = QFrame()
+        row.setStyleSheet("""
+            QFrame {
+                background: #1c2333;
+                border: 1px solid #2d3548;
+                border-radius: 6px;
+            }
+        """)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(10, 5, 10, 5)
+        row_layout.setSpacing(8)
+
+        num = QLabel(f"#{index + 1}")
+        num.setFixedWidth(24)
+        num.setStyleSheet("font-size: 12px; color: #7c5cfc; font-weight: 600; border: none;")
+        row_layout.addWidget(num)
+
+        url = item["url"]
+        display_url = url if len(url) <= 45 else url[:42] + "…"
+        url_label = QLabel(display_url)
+        url_label.setStyleSheet("font-size: 13px; color: #e6edf3; border: none;")
+        row_layout.addWidget(url_label, 1)
+
+        # Time range badge (only when set)
+        if item.get("start_sec") is not None or item.get("end_sec") is not None:
+            start_str = self._fmt_tc(item["start_sec"]) if item["start_sec"] is not None else "0:00"
+            end_str = self._fmt_tc(item["end_sec"]) if item["end_sec"] is not None else "∞"
+            time_label = QLabel(f"{start_str}–{end_str}")
+            time_label.setStyleSheet("font-size: 11px; color: #484f58; border: none;")
+            time_label.setFixedWidth(110)
+            row_layout.addWidget(time_label)
+
+        threads_label = QLabel(f"{item['threads']}t")
+        threads_label.setFixedWidth(24)
+        threads_label.setStyleSheet("font-size: 11px; color: #8b949e; border: none;")
+        row_layout.addWidget(threads_label)
+
+        btn_remove = QPushButton("✕")
+        btn_remove.setFixedSize(22, 22)
+        btn_remove.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_remove.setStyleSheet("""
+            QPushButton {
+                background: transparent; color: #484f58;
+                border: none; border-radius: 4px;
+                font-size: 12px;
+            }
+            QPushButton:hover { color: #f85149; background: rgba(248,81,73,0.15); }
+        """)
+        item_id = item["id"]
+        btn_remove.clicked.connect(lambda checked, qid=item_id: self._on_remove_queue_item(qid))
+        row_layout.addWidget(btn_remove)
+
+        return row
+
+    def _on_remove_queue_item(self, item_id: int):
+        """Remove a specific item from the queue by its id."""
+        self._queue = [item for item in self._queue if item["id"] != item_id]
+        self._rebuild_queue_list()
+
+    def _on_cancel_all(self):
+        """Cancel all queued items without interrupting the current download."""
+        self._queue.clear()
+        self._rebuild_queue_list()
+
+    def _clear_queue(self):
+        """Remove all items from the queue and reset UI state."""
+        self._queue.clear()
+        self._rebuild_queue_list()
+        self.queue_widget.hide()
+        self._layout_spacer.show()
+        self._is_downloading = False
         self.btn_download.setEnabled(True)
         self.btn_download.setText(self._tr("download_btn"))
-        self._show_step("step_input")
-        self.url_input.setFocus()
+
+    def _update_queue_title(self):
+        """Update the queue title to show number of pending items."""
+        count = len(self._queue)
+        if count:
+            self._lbl_queue_title.setText(f"{self._tr('queue_title')} ({count})")
+        else:
+            self._lbl_queue_title.setText(self._tr("queue_title"))
 
     # ------------------------------------------------------------
     #  Exports
@@ -930,16 +1358,13 @@ function f(){{
 
     def _reset_ui(self):
         self._result = None
+        self._clear_queue()
         self.url_input.setFocus()
         self._show_step("step_input")
 
     # ------------------------------------------------------------
     #  Helpers
     # ------------------------------------------------------------
-    def _set_progress_bar(self, pct: int):
-        w = int(self.progress_bar.width() * min(pct, 100) / 100)
-        self.progress_fill.setFixedWidth(w)
-
     @staticmethod
     def _parse_timecode(tc: str) -> Optional[int]:
         """Convert MM:SS or HH:MM:SS to seconds. Returns None for empty."""

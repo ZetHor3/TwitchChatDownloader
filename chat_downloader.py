@@ -5,7 +5,7 @@ import concurrent.futures
 import re
 import time
 import uuid
-from threading import Lock
+from threading import Event, Lock
 from typing import Any, Dict, List, Optional, Callable, Set, Tuple, Union
 
 import httpx
@@ -163,7 +163,8 @@ def _scan_range(video_id: str,
                 chunk_size: int = _CHUNK,
                 delay: float = 0.15,
                 progress_tracker: Optional["_ProgressTracker"] = None,
-                cancel_check: Optional[Callable[[], bool]] = None) -> List[Dict]:
+                cancel_check: Optional[Callable[[], bool]] = None,
+                pause_event: Optional[Event] = None) -> List[Dict]:
     """Scan one contiguous time range of a VOD.  Returns unique comments."""
     comments: List[Dict] = []
     seen: Set[str] = set()
@@ -171,6 +172,12 @@ def _scan_range(video_id: str,
     for chunk_start in range(start_offset, end_offset, chunk_size):
         if cancel_check and cancel_check():
             break
+        # Pause support — block while pause_event is set
+        if pause_event:
+            while pause_event.is_set():
+                if cancel_check and cancel_check():
+                    return comments
+                pause_event.wait(0.5)
         try:
             result = _fetch_comment_page(video_id, offset=float(chunk_start))
         except Exception:
@@ -255,7 +262,8 @@ def download_chat(url_or_id: str,
                   threads: int = 4,
                   start_sec: Optional[int] = None,
                   end_sec: Optional[int] = None,
-                  cancel_check: Optional[Callable[[], bool]] = None) -> Dict:
+                  cancel_check: Optional[Callable[[], bool]] = None,
+                  pause_event: Optional[Event] = None) -> Dict:
     """Fetch **all** chat messages for a Twitch VOD using time‑based scanning.
 
     Twitch GQL blocks cursor pagination with "integrity check", so we scan the
@@ -277,6 +285,8 @@ def download_chat(url_or_id: str,
         End offset in seconds (default video length).
     cancel_check : callable, optional
         Called periodically; return True to abort the download.
+    pause_event : threading.Event, optional
+        When set, scanner threads pause (sleep) until cleared.  Cancel still works.
 
     Returns
     -------
@@ -304,7 +314,7 @@ def download_chat(url_or_id: str,
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=actual_threads) as executor:
         fut_to_range = {
-            executor.submit(_scan_range, video_id, start, end, _CHUNK, 0.15, tracker, cancel_check): (start, end)
+            executor.submit(_scan_range, video_id, start, end, _CHUNK, 0.15, tracker, cancel_check, pause_event): (start, end)
             for start, end in ranges
         }
         for future in concurrent.futures.as_completed(fut_to_range):

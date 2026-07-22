@@ -47,7 +47,7 @@
 
 ```bash
 git clone https://github.com/ZetHor3/TwitchChatDownloader.git
-cd twitch-chat-downloader
+cd TwitchChatDownloader
 pip install -r requirements.txt
 ```
 

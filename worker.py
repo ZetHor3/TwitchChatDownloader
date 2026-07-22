@@ -1,4 +1,6 @@
 """Download worker — runs chat download in a background thread."""
+from threading import Event
+
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from chat_downloader import download_chat as _download_chat
@@ -21,9 +23,21 @@ class DownloadWorker(QThread):
         self.start_sec = start_sec
         self.end_sec = end_sec
         self._cancelled = False
+        self._pause_event = Event()
 
     def cancel(self):
         self._cancelled = True
+        self._pause_event.set()   # unblock any pause wait so cancel runs through
+
+    def pause(self):
+        self._pause_event.set()
+
+    def resume(self):
+        self._pause_event.clear()
+
+    @property
+    def is_paused(self) -> bool:
+        return self._pause_event.is_set() and not self._cancelled
 
     def run(self):
         try:
@@ -36,6 +50,7 @@ class DownloadWorker(QThread):
                 start_sec=self.start_sec,
                 end_sec=self.end_sec,
                 cancel_check=lambda: self._cancelled,
+                pause_event=self._pause_event,
             )
             if self._cancelled:
                 return
